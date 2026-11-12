@@ -1,0 +1,26 @@
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -858,6 +858,23 @@
+ 	    get_saved_state_pc(ss), get_saved_state_lr(ss), get_saved_state_sp(ss), fp,
+ 	    (uint64_t)saved_state64(ss)->far);
+ 
++	/* One targeted snapshot for the reproducible iOS 16.7.16 objc fault. */
++	static int objc_logged;
++	if (sig == 10 && slide && get_saved_state_pc(ss) - slide == 0x1800c41a4ULL &&
++	    __atomic_exchange_n(&objc_logged, 1, __ATOMIC_RELAXED) == 0) {
++		arm_saved_state64_t *state = saved_state64(ss);
++		uint64_t opt = 0, hdr[4] = {0};
++		uint32_t optwords[8] = {0};
++		int e1 = copyin((user_addr_t)(slide + 0x1e1d32938ULL), &opt, sizeof(opt));
++		int e2 = opt ? copyin((user_addr_t)opt, optwords, sizeof(optwords)) : -1;
++		int e3 = copyin((user_addr_t)state->x[28], hdr, sizeof(hdr));
++		printf("SWEET OBJC: x0=%#llx x8=%#llx x19=%#llx x20=%#llx x28=%#llx opt=%#llx errors=%d/%d/%d\n",
++		    state->x[0], state->x[8], state->x[19], state->x[20], state->x[28], opt, e1, e2, e3);
++		printf("SWEET OBJC: optwords=%#x/%#x/%#x/%#x/%#x/%#x/%#x/%#x hdr=%#llx/%#llx/%#llx/%#llx\n",
++		    optwords[0], optwords[1], optwords[2], optwords[3], optwords[4], optwords[5],
++		    optwords[6], optwords[7], hdr[0], hdr[1], hdr[2], hdr[3]);
++	}
++
+ 	char line[200];
+ 	int n = snprintf(line, sizeof(line), "CRASH %s bt", name);
+ 	for (int i = 0; i < 10 && fp != 0 && (fp & 7) == 0 && n < (int)sizeof(line) - 20; i++) {

@@ -1,0 +1,13 @@
+"""Patch 0225: the TX watchdog only logs; it no longer ends the transfer.
+
+0224n (halt requests acknowledged only, as on 0219n) still lost the USB console and the network
+right after the RNDIS start, like 0222n and 0223n. What the three had in common was 0222's TX
+watchdog: a network TX transfer older than 2 s was ended (End Transfer, 100 us) and the next one
+started at once. At the RNDIS start Windows resets the pipes and does not read the bulk IN pipe for
+a few seconds, so the watchdog fired there; DWC3 wants the End Transfer completion event before
+the next Start Transfer on that endpoint (Linux DWC3_EP_END_TRANSFER_PENDING), and without it the
+whole controller stopped. The watchdog now logs a TX transfer pending for 2 s (once a stall) and
+leaves it alone; the pending transfer completes when the host reads again, as on 0219n.
+The fix that stays: a failed TX start no longer leaves the endpoint busy for ever.
+Base: CI build tree 40478936434 plus 0180, 0211, 0216, 0218, 0219, 0222, 0223, 0224 for bsd/dev/sweet_usb.c.
+"""

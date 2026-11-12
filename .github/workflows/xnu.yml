@@ -1,0 +1,327 @@
+name: xnu
+
+on:
+  workflow_dispatch:
+    inputs:
+      macos_version:
+        description: macOS release whose xnu to build (13.5 = xnu-8796, iOS 16 era)
+        default: "13.5"
+      kernel_config:
+        description: RELEASE / DEVELOPMENT / DEBUG
+        default: DEVELOPMENT
+      machine_config:
+        description: xnu MACHINE_CONFIG
+        default: SWEET
+      keep_going:
+        description: make -k (collect all compile errors in one run)
+        default: "true"
+      runner:
+        description: macOS build host (Intel fallback when arm64 capacity is unavailable)
+        type: choice
+        default: macos-15
+        options:
+          - macos-15
+          - macos-15-intel
+      renderer_only:
+        description: Build the ARM64 iOS renderer libraries instead of XNU
+        type: boolean
+        default: false
+      wrapper_only:
+        description: Build only the ARM64 iOS backboardd launcher
+        type: boolean
+        default: false
+      compact_only:
+        description: Package a prior successful development kernel as XZ
+        type: boolean
+        default: false
+      source_run:
+        description: Successful XNU build run to package
+        default: "0"
+  push:
+    branches: [main]
+    paths:
+      - "xnu/patches/**"
+      - ".github/workflows/xnu.yml"
+
+concurrency:
+  group: xnu-${{ github.ref }}-${{ inputs.renderer_only && 'renderer' || inputs.wrapper_only && 'wrapper' || inputs.compact_only && 'compact' || 'kernel' }}
+  cancel-in-progress: true
+
+env:
+  DXB_REPO: https://github.com/blacktop/darwin-xnu-build
+  DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
+  MACOS_VERSION: ${{ inputs.macos_version || '13.5' }}
+  KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
+  MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
+
+jobs:
+  build:
+    if: ${{ !inputs.renderer_only && !inputs.wrapper_only && !inputs.compact_only }}
+    # Host architecture is independent of the SWEET arm64 kernel target.
+    runs-on: ${{ inputs.runner || 'macos-15' }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Preflight exact HFI service patch
+        run: |
+          baseline=4a0bc2a0d09383f6134c2eda5b8669029cdce012
+          if ! git cat-file -e "$baseline^{commit}" 2>/dev/null; then
+            git fetch --no-tags --depth=1 origin "$baseline"
+          fi
+          python3 tools/verify-gmu-service-patch.py "$RUNNER_TEMP/hfi-preflight"
+
+      - name: Fetch build script
+        run: |
+          git init -q dxb
+          git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
+          git -C dxb checkout -q FETCH_HEAD
+          # 12.5-14.3 use the top-level patches dir; ours go next to blacktop's
+          cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
+          python3 tools/require-sweet-build-patches.py dxb/build.sh
+          # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
+          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
+          grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
+          ls dxb/patches
+
+      - name: Deps
+        run: |
+          brew install jq gum bash cmake ninja
+          # build.sh only checks that xcodes exists (Xcode is preinstalled); no bottle on macOS 14
+          printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
+          sudo chmod +x /usr/local/bin/xcodes
+          sw_vers
+          ls -d /Applications/Xcode*.app
+          XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+          xcrun --find iig
+
+      - name: Build
+        working-directory: dxb
+        env:
+          # keep going after errors so one run reports every compile failure
+          MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
+        run: bash build.sh
+
+      - name: Verify required SWEET GPU patch in source and kernel
+        if: env.MACHINE_CONFIG == 'SWEET' && env.KERNEL_CONFIG == 'DEVELOPMENT'
+        run: |
+          set -x
+          bash tools/check-sweet-patch-reversal.sh
+          python3 tools/verify-gmu-service-patch.py --patched-tree dxb/xnu
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F 'SWEET SURF: wrap %s id' > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F 'SWEET CA: panel memory at GPU VA' > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F 'SWEET CA: renderer RAM disk mount rc=' > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F 'SWEET CA: dyld policy for %s input=' > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F 'SWEET A618 FILL: boot bandwidth commands=' > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F 'SWEET A618 FILL: PAS AUTH status=' > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F 'SWEET A618 FILL: pixels=' > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F 'SWEET A618 RING: %s WPTR written=' > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F 'SWEET A618 SMMU: context rc=' > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F 'SWEET A618 PRESENT: IOSurface copy ordinal=' > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F 'SWEET FB: GPU span committed swap=' > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F 'SWEET A618 ZAP: reserve verified' > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F 'sweet-a618-zap-reserve' > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F 'SWEET A618 PAS: INFO complete' > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F 'sweetgpupasprobe' > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F 'SWEET A618 BUS: AXI read=' > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F 'SWEET A618 BUS: CX halt ack' > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F 'SWEET A618 CP: ROQ fence DWORD=' > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F 'SWEET A618 CP: ROQ snapshot delay_us=' > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F 'SWEET A618 CP: ROQ settled to stock before SQE' > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F 'SWEET A618 CP: done rc=' > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F 'sweetgpucp' > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F 'SWEET A618 OOB: done rc=' > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F 'sweetgpuoob' > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F 'SWEET A618 COLD MAP: install rc=' > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F 'SWEET A618 MAP: done rc=0' > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F 'sweetgpumap' > /dev/null
+          cmp xnu/gpu/sweet_a618_prepare.inc dxb/xnu/iokit/Kernel/arm/sweet_a618_prepare.inc
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F 'SWEET A618 PREP: done rc=0' > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F 'sweetgpuprep' > /dev/null
+          cmp xnu/gpu/sweet_gmu_dcvs.c dxb/xnu/bsd/dev/sweet_gmu_dcvs.c
+          cmp xnu/gpu/sweet_gmu_dcvs.h dxb/xnu/bsd/dev/sweet_gmu_dcvs.h
+          grep -Fx $'bsd/dev/sweet_gmu_dcvs.c\t\tstandard' dxb/xnu/bsd/conf/files > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F 'SWEET GMU DCVS: done rc=' > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F 'sweetgmudcvs' > /dev/null
+          for name in sweet_hfi_config.c sweet_hfi_config.h sweet_gmu_board_profile.c sweet_gmu_board_profile.h sweet_rpmh_gpu_bcm_info.inc; do
+            cmp "xnu/gpu/$name" "dxb/xnu/bsd/dev/$name"
+          done
+          grep -Fx $'bsd/dev/sweet_hfi_config.c\t\tstandard' dxb/xnu/bsd/conf/files > /dev/null
+          grep -Fx $'bsd/dev/sweet_gmu_board_profile.c\t\tstandard' dxb/xnu/bsd/conf/files > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F 'SWEET GMU CONFIG: done rc=' > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F 'sweetgmucfg' > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F 'dbg_queue=%u/%u observations=%u' > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F "SWEET GMU HFI: begin GX and initial INIT/VERSION;" > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F "SWEET GMU HFI: retained until reboot; PERF/BW/TEST" > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F "SWEET GMU BOOT: bus/cache read_mask=" > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F "SWEET GMU BOOT: CM3_CFG valid=" > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F "SWEET GMU BOOT: readback mismatch off=" > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F "SWEET GMU BOOT: fresh CM3 init BABEFACE;" > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F "SWEET GMU BOOT: all mappings retained until reboot;" > /dev/null
+          for name in sweet_gpu_memory.cpp sweet_gpu_memory.h sweet_gpu_hfi_memory.cpp sweet_gpu_hfi_memory.h sweet_gpu_memory_probe.cpp sweet_gpu_smmu_probe.cpp sweet_gmu_memory.cpp sweet_gmu_memory.h sweet_gpu_gmu_start.cpp; do
+            cmp "xnu/gpu/$name" "dxb/xnu/iokit/Kernel/arm/$name"
+          done
+          for name in sweet_smmu_context.c sweet_smmu_context.h sweet_smmu_k6a.c sweet_smmu_k6a.h sweet_gpu_pte.c sweet_gpu_pte.h sweet_gpu_tables.c sweet_gpu_tables.h sweet_gpu_hfi_table.c sweet_gpu_hfi_table.h sweet_gmu_layout.c sweet_gmu_layout.h sweet_hfi_codec.c sweet_hfi_codec.h sweet_hfi_transport.c sweet_hfi_transport.h sweet_hfi_bw.c sweet_hfi_bw.h sweet_gpu_probe.c sweet_gmu_start.c sweet_gmu_start.h sweet_gmu_start_profile.h sweet_hfi_perf.c sweet_hfi_perf.h; do
+            cmp "xnu/gpu/$name" "dxb/xnu/bsd/dev/$name"
+          done
+          for name in sweet_gmu_postboot.c sweet_gmu_postboot.h sweet_gmu_postboot_profile.h sweet_gmu_arc.c sweet_gmu_arc.h; do
+            cmp "xnu/gpu/$name" "dxb/xnu/bsd/dev/$name"
+          done
+          grep -Fx $'bsd/dev/sweet_gmu_postboot.c\t\tstandard' dxb/xnu/bsd/conf/files > /dev/null
+          grep -Fx $'bsd/dev/sweet_gmu_arc.c\t\tstandard' dxb/xnu/bsd/conf/files > /dev/null
+          grep -Fx $'bsd/dev/sweet_hfi_bw.c\t\tstandard' dxb/xnu/bsd/conf/files > /dev/null
+          grep -Fx $'bsd/dev/sweet_smmu_context.c\t\tstandard' dxb/xnu/bsd/conf/files > /dev/null
+          grep -Fx $'bsd/dev/sweet_gmu_layout.c\t\tstandard' dxb/xnu/bsd/conf/files > /dev/null
+          grep -Fx 'iokit/Kernel/arm/sweet_gmu_memory.cpp                            optional iokitcpp' dxb/xnu/iokit/conf/files.arm64 > /dev/null
+          grep -Fx 'iokit/Kernel/arm/sweet_gpu_smmu_probe.cpp                        optional iokitcpp' dxb/xnu/iokit/conf/files.arm64 > /dev/null
+          grep -Fx 'iokit/Kernel/arm/sweet_gpu_gmu_start.cpp                         optional iokitcpp' dxb/xnu/iokit/conf/files.arm64 > /dev/null
+          grep -Fx $'bsd/dev/sweet_gmu_start.c\t\tstandard' dxb/xnu/bsd/conf/files > /dev/null
+          grep -Fx $'bsd/dev/sweet_hfi_perf.c\t\tstandard' dxb/xnu/bsd/conf/files > /dev/null
+          find dxb/build/xnu.obj -name sweet_smmu_context.o -print | grep -F 'sweet_smmu_context.o' > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F 'SWEET GPU SMMU: begin register-only test' > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F 'SWEET GPU SMMU: legacy GMU memory SID5, 131 data pages, 6 tables' > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F 'memory retained until reboot; no retry' > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F 'SWEET GPU MEM: inactive HFI Normal-NC=' > /dev/null
+          grep -F 'TCM prerequisites' dxb/xnu/bsd/dev/sweet_gpu_probe.c > /dev/null
+          grep -F 'GMU TCM already attempted' dxb/xnu/bsd/dev/sweet_gpu_probe.c > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F 'TCM prerequisites' > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F 'GMU TCM already attempted' > /dev/null
+          strings dxb/fakeroot/System/Library/Kernels/kernel.development.sweet | grep -F 'SMMU snapshot rc=' > /dev/null
+
+      - name: Package build tree for local compiles
+        if: always()
+        run: |
+          # Generated headers, config option headers, mig output and the patched
+          # source: enough to re-run any single compile command from the log locally.
+          SDK=$(xcrun --sdk macosx --show-sdk-path)
+          mkdir -p sdk-kernel-platform
+          cp -R "$SDK/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform" sdk-kernel-platform/ || true
+          tar czf buildtree.tgz \
+            --exclude='*.o' --exclude='*.cpo' --exclude='*.a' --exclude='*.dSYM' --exclude='*.unstripped' \
+            --exclude='kernel.development.*' --exclude='.git' \
+            -C dxb build/xnu.obj fakeroot/usr/local/include xnu \
+            -C .. sdk-kernel-platform
+          ls -la buildtree.tgz
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xnu-buildtree
+          path: buildtree.tgz
+          retention-days: 7
+
+      - name: Inspect closed KDK support libs
+        if: always()
+        run: |
+          mkdir -p out/kdk-libs
+          for lib in /Library/Developer/KDKs/*/System/Library/KernelSupport/lib*.a; do
+            b=$(basename "$lib" .a)
+            ar t "$lib" > "out/kdk-libs/$b.members.txt" 2>&1 || true
+            nm -m "$lib" > "out/kdk-libs/$b.nm.txt" 2>&1 || true
+            lipo -info "$lib" >> out/kdk-libs/arch.txt 2>&1 || true
+          done
+          ls -la out/kdk-libs
+
+      - name: Collect
+        if: always()
+        run: |
+          mkdir -p out
+          cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
+          ls -la out
+          (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xnu-kernel
+          path: out/
+          if-no-files-found: warn
+
+  renderer:
+    if: ${{ inputs.renderer_only && !inputs.wrapper_only && !inputs.compact_only }}
+    runs-on: macos-15-intel
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Mesa build tools
+        run: brew install meson ninja bison flex
+      - name: Build signed ARM64 iOS libraries
+        run: |
+          export PATH="$(brew --prefix flex)/bin:$PATH"
+          bash tools/build-sweet-renderer.sh "$RUNNER_TEMP/sweet-renderer"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sweet-ios16-renderer-arm64
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/sweet-renderer/sweet/lib/*.dylib
+            ${{ runner.temp }}/sweet-renderer/sweet/bin/sweetnet
+            ${{ runner.temp }}/sweet-renderer/CREDITS.md
+            ${{ runner.temp }}/sweet-renderer/Mesa-license.rst
+            ${{ runner.temp }}/sweet-renderer/SOURCES.txt
+            ${{ runner.temp }}/sweet-renderer/SHA256SUMS
+
+  wrapper:
+    if: ${{ inputs.wrapper_only && !inputs.compact_only }}
+    runs-on: macos-15-intel
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build signed ARM64 iOS backboardd launcher
+        run: bash tools/build-sweet-backboard-wrapper.sh "$RUNNER_TEMP/sweet-wrapper"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sweet-ios16-backboard-wrapper-arm64
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/sweet-wrapper/usr/libexec/backboardd
+            ${{ runner.temp }}/sweet-wrapper/SHA256SUMS
+
+  compact:
+    if: ${{ inputs.compact_only }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Fetch and verify the selected kernel artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN: ${{ inputs.source_run }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_RUN" =~ ^[0-9]+$ ]]
+          mkdir -p "$RUNNER_TEMP/kernel" "$RUNNER_TEMP/compact"
+          gh run download "$SOURCE_RUN" -R "$GITHUB_REPOSITORY" \
+            -n xnu-kernel -D "$RUNNER_TEMP/kernel"
+          cd "$RUNNER_TEMP/kernel"
+          grep -E '^[0-9a-f]{64}  kernel\.development\.sweet$' SHA256SUMS | sha256sum -c -
+          test -s kernel.development.sweet
+          cp kernel.development.sweet "$RUNNER_TEMP/compact/"
+      - name: Compress development kernel
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/compact"
+          sha256sum kernel.development.sweet > SHA256SUMS
+          xz -T2 -6 kernel.development.sweet
+          sha256sum kernel.development.sweet.xz > COMPRESSED-SHA256SUMS
+          ls -lh kernel.development.sweet.xz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sweet-compact-development-kernel
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/compact/kernel.development.sweet.xz
+            ${{ runner.temp }}/compact/SHA256SUMS
+            ${{ runner.temp }}/compact/COMPRESSED-SHA256SUMS

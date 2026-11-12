@@ -1,0 +1,330 @@
+#include "sweet_gmu_postboot.h"
+#include "sweet_gmu_postboot_profile.h"
+#include "sweet_hfi_codec.h"
+
+static int read_reg(struct sweet_gmu_postboot_state *s,
+    const struct sweet_gmu_postboot_ops *o, uint32_t off, uint32_t *v)
+{
+    s->last_offset=off;
+    if (o->read32(o->ctx,off,v)) return -2;
+    s->last_value=*v;
+    return *v==UINT32_MAX ? -2 : 0;
+}
+static int write_reg(struct sweet_gmu_postboot_state *s,
+    const struct sweet_gmu_postboot_ops *o, uint32_t off, uint32_t v)
+{
+    s->last_offset=off;s->last_value=v;
+    return o->write32(o->ctx,off,v) || o->barrier(o->ctx) ? -2 : 0;
+}
+static void phase(struct sweet_gmu_postboot_state *s,
+    const struct sweet_gmu_postboot_ops *o, enum sweet_gmu_postboot_stage p)
+{
+    s->stage=p;if(o->progress)o->progress(o->ctx,p);
+}
+static int check(struct sweet_gmu_postboot_state *s, const struct sweet_gmu_postboot_ops *o)
+{
+    if(o->check(o->ctx))return -3;
+    int rc=read_reg(s,o,A6XX_GMU_GMU2HOST_INTR_INFO,&s->host_irq);
+    if(rc)return rc;
+    rc=read_reg(s,o,A6XX_GMU_AO_HOST_INTERRUPT_STATUS,&s->ao_irq);
+    if(rc)return rc;
+    if((s->host_irq&(1u<<15)) || (s->ao_irq&0x29u))return -5;
+    if(s->stage>=SWEET_GMU_POST_INIT && (s->host_irq&2u))return -6;
+    if(s->stage>=SWEET_GMU_POST_HFI){
+        rc=read_reg(s,o,A6XX_GMU_SPTPRAC_PWR_CLK_STATUS,&s->gx_status);if(rc)return rc;
+        if((s->gx_status&(SWEET_GMU_GX_OFF|SWEET_GMU_SPTP_ON|SWEET_GMU_SPTP_OFF))!=SWEET_GMU_SPTP_ON)return -3;
+    }
+    return 0;
+}
+static int poll(struct sweet_gmu_postboot_state *s,const struct sweet_gmu_postboot_ops *o,
+    uint32_t off,uint32_t mask,uint32_t expected,unsigned timeout_us,uint32_t *value)
+{
+    for(unsigned us=0;;us+=100){
+        int rc=check(s,o);if(rc)return rc;
+        rc=read_reg(s,o,off,value);if(rc)return rc;
+        if((*value&mask)==expected)return 0;
+        if(us==timeout_us)return -4;
+        if(o->delay_us(o->ctx,100))return -2;
+    }
+}
+static void queue_snapshot(struct sweet_gmu_postboot_state *s,struct sweet_hfi_transport *t)
+{
+    t->barrier(t->ctx);
+    s->cmd_read=t->words[16];s->cmd_write=t->words[17];
+    s->msg_read=t->words[28];s->msg_write=t->words[29];
+    s->dbg_read=t->words[40];s->dbg_write=t->words[41];
+}
+static int fresh_table(struct sweet_hfi_transport *t,int initial)
+{
+    static const uint32_t table[6]={0,54,6,12,4,4};
+    static const uint32_t type[4]={0x0a00,0x0a04,0x2805,0x1401};
+    t->barrier(t->ctx);
+    for(unsigned i=0;i<6;i++)if(t->words[i]!=table[i])return -3;
+    for(unsigned i=0;i<4;i++){
+        volatile uint32_t *h=t->words+6+12*i;
+        if(h[0]!=(i!=3) || h[1]!=0x601000e0u+4096*i || h[2]!=type[i] ||
+            h[3]!=1024 || h[4] || h[5] || h[6]!=1 || h[7]!=1 ||
+            h[8]>1 || h[9]>1 || h[10]>=1024 || h[11]>=1024)return -3;
+        /* Firmware may already publish debug records after HFI CTRL. Never
+         * discard them or require its producer-owned indexes to stay zero. */
+        if((initial || i!=2) && (h[10] || h[11]))return -3;
+    }
+    return 0;
+}
+static int event(struct sweet_gmu_postboot_state *s,const uint32_t *response,size_t words)
+{
+    unsigned id=response[0]&255u,type=(response[0]>>16)&15u;
+    s->event_header=response[0];s->event_code=words>1 ? response[1] : 0;
+    if(type>=2)return -6;
+    if(id==100){if(words<2)return -6;s->firmware_error=s->event_code;return -7;}
+    if(id!=101 || words!=4)return -6;
+    ++s->debug_messages;return 0;
+}
+static int drain_events(struct sweet_gmu_postboot_state *s,const struct sweet_gmu_postboot_ops *o,
+    struct sweet_hfi_transport *t,unsigned queue)
+{
+    unsigned consumed=0;uint32_t irq=queue==1 ? 1u : 4u;
+    /* One queue holds1024 words; cap work even if firmware keeps refilling. */
+    for(unsigned n=0;n<1024;n++){
+        uint32_t response[255];size_t words=0;
+        int rc=sweet_hfi_receive_queue(t,queue,response,255,&words);
+        queue_snapshot(s,t);
+        if(rc<0)return -6;
+        if(rc){
+            uint32_t r=queue==1 ? s->msg_read : s->dbg_read;
+            uint32_t w=queue==1 ? s->msg_write : s->dbg_write;
+            if(r!=w)return -6; /* incomplete packet, not an empty queue */
+            if(consumed || (s->host_irq&irq)){
+                rc=write_reg(s,o,A6XX_GMU_GMU2HOST_INTR_CLR,irq);if(rc)return rc;
+            }
+            return 0;
+        }
+        rc=event(s,response,words);if(rc)return rc;
+        ++consumed;
+    }
+    return -6;
+}
+static int exchange(struct sweet_gmu_postboot_state *s,const struct sweet_gmu_postboot_ops *o,
+    struct sweet_hfi_transport *t,const uint32_t *cmd,size_t n,unsigned kind)
+{
+    static const unsigned ids[5]={0,1,4,3,5};
+    static const unsigned sizes[5]={5,2,43,160,2};
+    static const unsigned positions[6]={0,5,7,50,210,212};
+    if(kind>=5 || n!=sizes[kind] || s->next_sequence!=kind+1 ||
+        cmd[0]!=((kind+1)<<20 | (uint32_t)n<<8 | ids[kind]))return -3;
+    struct sweet_gmu_exchange_state *e=&s->exchange[kind];
+    if(e->attempted)return -3;
+    int rc=check(s,o);if(rc)return rc;
+    /* ACK publication need not imply the producer has already made its CMD
+     * read index visible. Wait boundedly before reusing the command queue. */
+    for(unsigned us=0;;us+=100){
+        rc=check(s,o);if(rc)return rc;
+        queue_snapshot(s,t);
+        e->cmd_before_read=s->cmd_read;e->cmd_before_write=s->cmd_write;
+        if(s->cmd_write!=positions[kind] || s->cmd_read>positions[kind])return -3;
+        if(s->cmd_read==positions[kind])break;
+        if(us==100000)return -4;
+        if(o->delay_us(o->ctx,100))return -2;
+    }
+    /* Mark before publishing: an unsuccessful doorbell can still have fired. */
+    e->attempted=1;e->request_header=cmd[0];
+    if(kind==1)s->version_sent=1;else if(kind==0)s->init_sent=1;
+    int sent=kind==4 ? sweet_hfi_send_final(t,cmd,n) : sweet_hfi_send(t,cmd,n);
+    e->published=sent==0 || sent==-2;
+    queue_snapshot(s,t);
+    e->cmd_after_read=s->cmd_read;e->cmd_after_write=s->cmd_write;
+    if(sent)return -6;
+    for(unsigned us=0;;us+=100){
+        uint32_t response[255];size_t words=0,payload_words=0;
+        const uint32_t *payload=0;
+        rc=check(s,o);if(rc)return rc;
+        rc=drain_events(s,o,t,2);if(rc)return rc;
+        rc=sweet_hfi_receive(t,response,255,&words);
+        queue_snapshot(s,t);
+        e->cmd_after_read=s->cmd_read;e->cmd_after_write=s->cmd_write;
+        if(rc<0)return -6;
+        if(!rc){
+            unsigned id=response[0]&255u,type=(response[0]>>16)&15u;
+            if(type<2 && (id==100 || id==101)){
+                rc=event(s,response,words);if(rc)return rc;
+                /* Leave the ACK deadline bounded even if debug events stream.
+                 * This first diagnostic records events without logging their
+                 * potentially private text or treating DEBUG as an ACK. */
+                goto next_poll;
+            }
+            s->response_header=response[0];
+            s->original_header=words>1 ? response[1] : 0;
+            e->response_header=s->response_header;e->original_header=s->original_header;
+            rc=sweet_hfi_response(response,words,(uint8_t)cmd[0],(uint16_t)(cmd[0]>>20),
+                &s->firmware_error,&payload,&payload_words);
+            if(rc==0 || rc==2)e->firmware_error=s->firmware_error;
+            if(rc==2)return -7;
+            /* Legacy firmware may omit size/type in the echoed request
+             * (0151 INIT: sent00100500, echoed00100000). The codec already
+             * checks command ID and sequence, plus outer ACK framing/error.
+             * Stock receive_ack_cmd matches sequence, not the whole header. */
+            if(rc || (kind==1 && payload_words<1))return -6;
+            e->acked=1;++s->next_sequence;
+            if(kind==1){s->firmware_version=payload[0];s->version_ack=1;}
+            else if(kind==0)s->init_ack=1;
+            /* Polled reader never sleeps on an IRQ. Clear only MSGQ bit0,
+             * never the host boot request or any error indications. */
+            rc=write_reg(s,o,A6XX_GMU_GMU2HOST_INTR_CLR,1);if(rc)return rc;
+            return check(s,o);
+        }
+next_poll:
+        if(us==100000)return -4;
+        if(o->delay_us(o->ctx,100))return -2;
+    }
+}
+int sweet_gmu_postboot(struct sweet_gmu_postboot_state *s,
+    const struct sweet_gmu_postboot_ops *o,struct sweet_hfi_transport *t,uint32_t vote)
+{
+    if(!s || !o || !t || !o->read32 || !o->write32 || !o->barrier ||
+        !o->delay_us || !o->check || !t->words || ((uintptr_t)t->words&3) ||
+        t->bytes!=0x5000 || !t->barrier || !t->doorbell || t->poisoned || t->tx_closed || s->attempted)return -1;
+    s->attempted=1;s->vote=vote;phase(s,o,SWEET_GMU_POST_PREFLIGHT);
+    s->session_transport=t;s->session_words=t->words;s->session_ops=*o;
+    s->session_transport_ctx=t->ctx;s->session_barrier=t->barrier;s->session_doorbell=t->doorbell;
+    /* Conservative bounded ARC indexes; caller proves level/profile mapping. */
+    if(!(vote>>16) || !(vote&255) || (vote&255)>15 || !((vote>>8)&255) || ((vote>>8)&255)>15)return -3;
+    int rc=check(s,o);if(rc)return rc;
+    if(s->host_irq&(SWEET_GMU_BOOT_ACK|1))return -3; /* reject stale completion */
+    rc=fresh_table(t,1);if(rc)return rc;
+    rc=read_reg(s,o,A6XX_GMU_HFI_CTRL_STATUS,&s->hfi_status);if(rc)return rc;
+    if(s->hfi_status&1)return -3;
+    phase(s,o,SWEET_GMU_POST_OOB);
+    rc=write_reg(s,o,A6XX_GMU_BOOT_SLUMBER_OPTION,0);if(rc)return rc;
+    rc=write_reg(s,o,A6XX_GMU_GX_VOTE_IDX,vote&255);if(rc)return rc;
+    rc=write_reg(s,o,A6XX_GMU_MX_VOTE_IDX,(vote>>8)&255);if(rc)return rc;
+    rc=check(s,o);if(rc)return rc;
+    if(s->host_irq&SWEET_GMU_BOOT_ACK)return -3;
+    s->oob_issued=1;
+    rc=write_reg(s,o,A6XX_GMU_HOST2GMU_INTR_SET,SWEET_GMU_BOOT_REQUEST);if(rc)return rc;
+    rc=poll(s,o,A6XX_GMU_GMU2HOST_INTR_INFO,SWEET_GMU_BOOT_ACK,SWEET_GMU_BOOT_ACK,100000,&s->host_irq);if(rc)return rc;
+    s->oob_ack=1;
+    rc=write_reg(s,o,A6XX_GMU_GMU2HOST_INTR_CLR,SWEET_GMU_BOOT_ACK);if(rc)return rc;
+    phase(s,o,SWEET_GMU_POST_GX);
+    rc=poll(s,o,A6XX_GMU_SPTPRAC_PWR_CLK_STATUS,SWEET_GMU_GX_OFF,0,100000,&s->gx_status);if(rc)return rc;
+    /* Fresh CM3/OOB may already leave SPTPRAC on (0150 observed0x28).
+     * Stock still writes POWERON and polls; it does not require an off->on
+     * edge here. Preserve that write and the complete bounded status check. */
+    /* Only now may we touch this GX-domain register. OOB remains asserted. */
+    phase(s,o,SWEET_GMU_POST_SPTP);s->sptp_issued=1;
+    rc=write_reg(s,o,A6XX_GMU_GX_SPTPRAC_POWER_CONTROL,SWEET_GMU_SPTP_CONTROL);if(rc)return rc;
+    rc=poll(s,o,A6XX_GMU_SPTPRAC_PWR_CLK_STATUS,SWEET_GMU_SPTP_ON|SWEET_GMU_GX_OFF|SWEET_GMU_SPTP_OFF,
+        SWEET_GMU_SPTP_ON,10000,&s->gx_status);if(rc)return rc;
+    rc=read_reg(s,o,A6XX_GMU_HFI_CTRL_STATUS,&s->hfi_status);if(rc)return rc;
+    if(s->hfi_status&1)return -3;
+    phase(s,o,SWEET_GMU_POST_HFI);s->hfi_issued=1;
+    rc=write_reg(s,o,A6XX_GMU_HFI_CTRL_INIT,1);if(rc)return rc;
+    rc=poll(s,o,A6XX_GMU_HFI_CTRL_STATUS,1,1,100000,&s->hfi_status);if(rc)return rc;
+    if(o->barrier(o->ctx))return -2;
+    uint32_t cmd[5];
+    phase(s,o,SWEET_GMU_POST_INIT);
+    rc=check(s,o);if(rc)return rc;
+    if(s->host_irq&1)return -3;
+    rc=fresh_table(t,0);if(rc)return rc;
+    rc=drain_events(s,o,t,2);if(rc)return rc;
+    if(sweet_hfi_v1_init(cmd,5,1,0x60200000,0x4000,1))return -3;
+    s->next_sequence=1;
+    rc=exchange(s,o,t,cmd,5,0);if(rc)return rc;
+    phase(s,o,SWEET_GMU_POST_VERSION);
+    /* Like stock: the first INIT is legacy; read protocol version after its ACK. */
+    rc=read_reg(s,o,A6XX_GMU_HFI_VERSION_INFO,&s->wire_version);if(rc)return rc;
+    if((s->wire_version>>28)>=2)return -3;
+    if(sweet_hfi_v1_version(cmd,5,2))return -3;
+    rc=exchange(s,o,t,cmd,2,1);if(rc)return rc;
+    if((s->firmware_version>>28)!=1 || ((s->firmware_version>>16)&0xfff)<8)return -3;
+    /* This intentionally stops before PERF/BW/TEST. Poll health and consume
+     * service events for10s; passing is not a persistent stability guarantee. */
+    phase(s,o,SWEET_GMU_POST_OBSERVE);
+    for(unsigned n=1;n<=100;n++){
+        if(o->delay_us(o->ctx,100000))return -2;
+        rc=check(s,o);if(rc)return rc;
+        if(s->host_irq&2)return -6; /* no side-message protocol in this test */
+        rc=drain_events(s,o,t,1);if(rc)return rc;
+        rc=drain_events(s,o,t,2);if(rc)return rc;
+        rc=check(s,o);if(rc)return rc;
+        if(s->host_irq&7)return -6; /* new unexamined events cannot count as quiet */
+        rc=read_reg(s,o,A6XX_GMU_HFI_CTRL_STATUS,&s->hfi_status);if(rc)return rc;
+        if(!(s->hfi_status&1))return -3;
+        if(n==10 || n==100){
+            unsigned i=s->observed++;
+            s->samples[i][0]=s->host_irq;s->samples[i][1]=s->ao_irq;
+            s->samples[i][2]=s->gx_status;s->samples[i][3]=s->hfi_status;
+            s->samples[i][4]=s->msg_read;s->samples[i][5]=s->msg_write;
+            s->samples[i][6]=s->dbg_read;s->samples[i][7]=s->dbg_write;
+        }
+    }
+    phase(s,o,SWEET_GMU_POST_READY);return 0;
+}
+
+static int config_sample(struct sweet_gmu_config_state *c,struct sweet_gmu_postboot_state *s,
+    const struct sweet_gmu_postboot_ops *o,struct sweet_hfi_transport *t)
+{
+    if(c->observed>=3)return -3;
+    int rc=check(s,o);if(rc)return rc;
+    rc=read_reg(s,o,A6XX_GMU_HFI_CTRL_STATUS,&s->hfi_status);if(rc)return rc;
+    queue_snapshot(s,t);
+    unsigned i=c->observed++;
+    c->samples[i][0]=s->host_irq;c->samples[i][1]=s->ao_irq;
+    c->samples[i][2]=s->gx_status;c->samples[i][3]=s->hfi_status;
+    c->samples[i][4]=s->msg_read;c->samples[i][5]=s->msg_write;
+    c->samples[i][6]=s->dbg_read;c->samples[i][7]=s->dbg_write;
+    c->samples[i][8]=s->cmd_read;c->samples[i][9]=s->cmd_write;
+    return 0;
+}
+int sweet_gmu_configure(struct sweet_gmu_config_state *c,struct sweet_gmu_postboot_state *s,
+    const struct sweet_gmu_postboot_ops *o,struct sweet_hfi_transport *t,
+    const struct sweet_hfi_perf_table *perf,const struct sweet_hfi_bw_table *bw,
+    unsigned gpu_index,unsigned bw_level)
+{
+    if(!c || !s || !o || !t || !o->read32 || !o->write32 || !o->barrier ||
+        !o->delay_us || !o->check || !t->words || ((uintptr_t)t->words&3) ||
+        t->bytes!=0x5000 || !t->barrier || !t->doorbell || c->attempted || c->configured || c->observed || s->config_attempted)return -1;
+    c->attempted=1;s->config_attempted=1;
+    if(s->stage!=SWEET_GMU_POST_READY || !s->init_ack || !s->version_ack ||
+        s->observed!=2 || s->next_sequence!=3 || t->poisoned || t->tx_closed ||
+        s->session_transport!=t || s->session_words!=t->words ||
+        s->session_transport_ctx!=t->ctx || s->session_barrier!=t->barrier || s->session_doorbell!=t->doorbell ||
+        s->session_ops.ctx!=o->ctx || s->session_ops.read32!=o->read32 || s->session_ops.write32!=o->write32 ||
+        s->session_ops.barrier!=o->barrier || s->session_ops.delay_us!=o->delay_us || s->session_ops.check!=o->check ||
+        (s->wire_version>>28)>=2 || (s->firmware_version>>28)!=1 ||
+        ((s->firmware_version>>16)&0xfff)<8)return -3;
+    phase(s,o,SWEET_GMU_CONFIG_PREFLIGHT);
+    if(sweet_hfi_config_prepare(&c->packets,perf,bw,gpu_index,bw_level,s->vote))return -3;
+    int rc=check(s,o);if(rc)return rc;
+    queue_snapshot(s,t);
+    if(s->cmd_read>7 || s->cmd_write!=7)return -3;
+    rc=drain_events(s,o,t,1);if(rc)return rc;
+    rc=drain_events(s,o,t,2);if(rc)return rc;
+    const uint32_t *commands[3]={c->packets.perf,c->packets.bw,c->packets.test};
+    const unsigned sizes[3]={43,160,2};
+    for(unsigned i=0;i<3;i++){
+        phase(s,o,(enum sweet_gmu_postboot_stage)(SWEET_GMU_CONFIG_PERF+i));
+        rc=check(s,o);if(rc)return rc;
+        /* Before sending TEST HFI must still be active. Its ACK/observations
+         * must not assume status1 survives the command-mode terminator. */
+        rc=read_reg(s,o,A6XX_GMU_HFI_CTRL_STATUS,&s->hfi_status);if(rc)return rc;
+        if(!(s->hfi_status&1))return -3;
+        rc=exchange(s,o,t,commands[i],sizes[i],i+2);
+        if(i==2 && s->exchange[4].acked)c->configured=1;
+        if(rc)return rc;
+    }
+    if(!t->tx_closed || s->next_sequence!=6 || !c->configured)return -3;
+    phase(s,o,SWEET_GMU_CONFIG_OBSERVE);
+    rc=config_sample(c,s,o,t);if(rc)return rc;
+    for(unsigned n=1;n<=100;n++){
+        if(o->delay_us(o->ctx,100000))return -2;
+        rc=check(s,o);if(rc)return rc;
+        rc=drain_events(s,o,t,1);if(rc)return rc;
+        rc=drain_events(s,o,t,2);if(rc)return rc;
+        rc=check(s,o);if(rc)return rc;
+        if(s->host_irq&7)return -6;
+        if(n==10 || n==100){
+            rc=config_sample(c,s,o,t);if(rc)return rc;
+        }
+    }
+    phase(s,o,SWEET_GMU_CONFIG_READY);return 0;
+}

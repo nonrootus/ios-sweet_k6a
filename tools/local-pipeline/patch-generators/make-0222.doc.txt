@@ -1,0 +1,19 @@
+"""Patch 0222: the USB network keeps going: endpoint halt requests, failed TX starts, a TX watchdog.
+
+0219n, Windows ICS over RNDIS, copying apps to the phone with scp: a 55 MB transfer went through,
+then a 180 MB one stopped and later a 67 MB one too (sshd reset, then 192.168.137.2 unreachable
+until the cable was replugged). The console showed the phone's TX counter stuck while RX still
+counted, then CLEAR_FEATURE(ENDPOINT_HALT) from Windows for 0x83, 0x03 and 0x84 (it resets a pipe
+after an error). Three faults in the gadget:
+ - ud_tx_kick_locked() marked the network IN endpoint busy before Start Transfer and ignored its
+   failure: one failed start and ue0 never sent again;
+ - CLEAR_FEATURE / SET_FEATURE(ENDPOINT_HALT) were only acknowledged: the running transfer stayed,
+   the data sequence was not reset (DWC3 Clear Stall), so after Windows reset a pipe the two sides
+   disagreed and the link stopped;
+ - nothing noticed a network TX transfer that never completes.
+Now a failed start drops the frame and leaves the endpoint idle; ENDPOINT_HALT clear ends the
+transfer, issues Clear Stall and restarts that endpoint's work (RX re-armed, TX queue kicked,
+RNDIS notification re-sent), set issues Set Stall (Linux __dwc3_gadget_ep_set_halt); and a TX
+transfer older than 2 s is ended and the queue goes on.
+Base: CI build tree 40478936434 plus 0180, 0211, 0216, 0218 and 0219 for bsd/dev/sweet_usb.c.
+"""

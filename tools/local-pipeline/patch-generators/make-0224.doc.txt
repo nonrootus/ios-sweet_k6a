@@ -1,0 +1,12 @@
+"""Patch 0224: ENDPOINT_HALT requests are only acknowledged again (as up to 0219).
+
+0223n (Clear Stall alone) went the same way as 0222n (End Transfer + Clear Stall + restart): at the
+RNDIS start Windows cleared the halts of 0x83, 0x03 and 0x84, and right after the third the USB
+console stopped and the phone no longer answered over the network. Up to 0219 those requests were
+acknowledged without touching the controller, and RNDIS ran (0219n carried internet and a 55 MB
+scp). So any DWC3 command on those endpoints at that moment wedges this gadget; the halt requests
+go back to being acknowledged only, and logged. What stays from 0222: a failed TX start no longer
+leaves the network IN endpoint busy for ever, and a TX transfer older than 2 s is ended (these are
+what stopped ue0's TX during big copies on 0219n).
+Base: CI build tree 40478936434 plus 0180, 0211, 0216, 0218, 0219, 0222 and 0223 for bsd/dev/sweet_usb.c.
+"""

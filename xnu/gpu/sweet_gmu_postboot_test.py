@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""Actual postboot/queue codecs with modeled MMIO and firmware, never hardware.
+Usage: sweet_gmu_postboot_test.py STOCK_CACHE BUILD_DIRECTORY
+"""
+from pathlib import Path
+import re, subprocess, sys
+stock, work = map(Path, sys.argv[1:]); work.mkdir(parents=True, exist_ok=True)
+src = Path(__file__).resolve().parent
+regs = (stock/'a6xx_reg.h').read_text()
+for name, value in re.findall(r'^#define (A6XX_\w+) (0x[0-9a-f]+)u$', (src/'sweet_gmu_postboot_profile.h').read_text(), re.M):
+    raw = int(re.search(r'^#define\s+'+name+r'\s+(0x[0-9a-fA-F]+)\s*$', regs, re.M)[1], 16)
+    assert raw*4-0x6a000 == int(value, 16), name
+program = r'''
+#include <assert.h>
+#include <stdio.h>
+#include <string.h>
+#include "sweet_gmu_postboot.h"
+#include "sweet_gmu_postboot_profile.h"
+#include "sweet_gpu_hfi_table.h"
+static uint32_t mmio[0x31000/4],table[0x5000/4],trace[32][2];
+static struct sweet_gmu_postboot_state s;
+static unsigned calls,fail_at,elapsed,nwrites,doorbells,timeout_stage,corrupt_ack,late_fault;
+static int doorbell_fail;
+static unsigned gx_powered;
+static unsigned event_kind,gx_after_oob,observe_fault;
+static unsigned sptp_settle,sptp_lost,echo_mode;
+static unsigned early_debug,late_event,late_queue,late_sent;
+static void enqueue_event(unsigned queue,unsigned id){
+ unsigned header=6+12*queue,w=table[header+11],base=56+1024*queue;
+ uint32_t words[]={id|0x400|(1u<<16),0x4321,0,0};
+ for(unsigned i=0;i<4;i++)table[base+(w+i)%1024]=words[i];
+ table[header+11]=(w+4)%1024;
+ mmio[A6XX_GMU_GMU2HOST_INTR_INFO/4]|=queue==1?1u:4u;
+}
+static int callback(void){return ++calls==fail_at ? -1:0;}
+static int read32(void *p,uint32_t off,uint32_t *v){(void)p;assert(!(off&3)&&off<sizeof(mmio));*v=mmio[off/4];return callback();}
+static int write32(void *p,uint32_t off,uint32_t v){
+ (void)p;assert(!(off&3)&&off<sizeof(mmio));assert(nwrites<32);
+ trace[nwrites][0]=off;trace[nwrites++][1]=v;
+ if(off==A6XX_GMU_HOST2GMU_INTR_SET){
+  assert(v==SWEET_GMU_BOOT_REQUEST);assert(s.oob_issued); // no host request clear
+  if(timeout_stage!=1){mmio[A6XX_GMU_GMU2HOST_INTR_INFO/4]|=SWEET_GMU_BOOT_ACK;
+   if(timeout_stage!=2){gx_powered=1;mmio[A6XX_GMU_SPTPRAC_PWR_CLK_STATUS/4]=gx_after_oob;}}
+ }else if(off==A6XX_GMU_GMU2HOST_INTR_CLR){
+  assert(v==SWEET_GMU_BOOT_ACK || v==1 || v==4);mmio[A6XX_GMU_GMU2HOST_INTR_INFO/4]&=~v;
+ }else if(off==A6XX_GMU_GX_SPTPRAC_POWER_CONTROL){
+  assert(gx_powered && s.oob_ack && s.sptp_issued && v==0x778000);
+  if(timeout_stage!=3)mmio[A6XX_GMU_SPTPRAC_PWR_CLK_STATUS/4]|=8;
+ }else if(off==A6XX_GMU_HFI_CTRL_INIT){
+  assert(gx_powered && (mmio[A6XX_GMU_SPTPRAC_PWR_CLK_STATUS/4]&8) && s.hfi_issued && v==1);
+  if(timeout_stage!=4)mmio[A6XX_GMU_HFI_CTRL_STATUS/4]=1;
+  if(sptp_lost)mmio[A6XX_GMU_SPTPRAC_PWR_CLK_STATUS/4]=0x2c;
+  if(early_debug)enqueue_event(2,early_debug);
+ }else mmio[off/4]=v;
+ return callback(); // failure can be AFTER the write
+}
+static int barrier(void *p){(void)p;return callback();}
+static void dma_barrier(void *p){(void)p;}
+static int delay(void *p,unsigned us){(void)p;assert(us==100 || us==100000);elapsed+=us;
+ if(sptp_settle && s.stage==SWEET_GMU_POST_SPTP && elapsed>=200)mmio[A6XX_GMU_SPTPRAC_PWR_CLK_STATUS/4]&=~0x14u;
+ if(observe_fault && elapsed>=1000000)mmio[A6XX_GMU_GMU2HOST_INTR_INFO/4]|=1u<<15;
+ if(late_event && !late_sent && elapsed>=1000000){enqueue_event(late_queue,late_event);late_sent=1;}
+ return callback();}
+static int check(void *p){(void)p;if(late_fault && s.stage>=late_fault)return -1;return callback();}
+static int doorbell(void *p){
+ (void)p;++doorbells;assert(mmio[A6XX_GMU_HFI_CTRL_STATUS/4]==1 && gx_powered);
+ unsigned read=table[16],write=table[17];assert(read!=write);
+ uint32_t hdr=table[56+read];unsigned words=(hdr>>8)&255,id=hdr&255;
+ assert((id==0 && words==5 && s.init_sent) || (id==1 && words==2 && s.version_sent));
+ if(id==0){assert(table[57+read]==0 && table[58+read]==0x60200000 && table[59+read]==0x4000 && table[60+read]==1);}
+ else assert(table[57+read]==0x10080000);
+ if(doorbell_fail)return -1;
+ if(timeout_stage==5+id)return 0;
+ unsigned n=(id==1 || echo_mode)?4:3,w=table[29];
+ if(event_kind && id==0){
+  unsigned event[]={((event_kind==1?100u:101u)|0x400u|(1u<<16)),0x1234,0x5678,0};
+  for(unsigned i=0;i<4;i++)table[56+1024+(w+i)%1024]=event[i];
+  w=(w+4)%1024;
+ }
+ uint32_t ack[4]={126u|(2u<<16)|(n<<8),hdr,0,0x10080001};
+ if(echo_mode)ack[1]&=0xfff000ffu;
+ if(echo_mode==2)ack[1]|=0x000fff00u; // echoed metadata is not identity
+ if(corrupt_ack==1)ack[1]^=1u<<20;
+ if(corrupt_ack==2)ack[2]=0x123;
+ if(corrupt_ack==3)ack[0]^=1;
+ if(corrupt_ack==4)ack[1]^=1u; // wrong original command ID
+ if(corrupt_ack==5)ack[0]=(ack[0]&~0xff00u)|0x100;
+ if(corrupt_ack==6 && id==1)ack[3]=0x10070000;
+ if(corrupt_ack==7 && id==1)ack[3]=0x20080000;
+ if(corrupt_ack==8 && id==1){n=3;ack[0]=(ack[0]&~0xff00u)|0x300;}
+ for(unsigned i=0;i<n;i++)table[56+1024+(w+i)%1024]=ack[i];
+ table[29]=(w+n)%1024;table[16]=write;
+ mmio[A6XX_GMU_GMU2HOST_INTR_INFO/4]|=1;
+ return 0;
+}
+static struct sweet_gmu_postboot_ops ops={0,read32,write32,barrier,delay,check,0};
+static struct sweet_hfi_transport transport;
+static void reset(void){
+ memset(&s,0,sizeof(s));memset(mmio,0,sizeof(mmio));memset(trace,0,sizeof(trace));
+ calls=fail_at=elapsed=nwrites=doorbells=timeout_stage=corrupt_ack=late_fault=gx_powered=0;doorbell_fail=0;
+ event_kind=gx_after_oob=observe_fault=early_debug=late_event=late_queue=late_sent=0;
+ sptp_settle=sptp_lost=echo_mode=0;
+ assert(!sweet_gpu_hfi_table_init(table,sizeof(table),0x60100000));
+ mmio[A6XX_GMU_SPTPRAC_PWR_CLK_STATUS/4]=0xc0;
+ mmio[A6XX_GMU_HFI_VERSION_INFO/4]=0x10000000;
+ transport=(struct sweet_hfi_transport){table,sizeof(table),0,dma_barrier,doorbell,0,0};
+}
+static int run(void){return sweet_gmu_postboot(&s,&ops,&transport,0x00400202);}
+static void once(void){unsigned c=calls,w=nwrites,d=doorbells;assert(run()==-1);assert(c==calls&&w==nwrites&&d==doorbells);}
+int main(void){
+ reset();assert(!run());assert(s.stage==SWEET_GMU_POST_READY && s.init_ack && s.version_ack && s.firmware_version==0x10080001);
+ assert(s.oob_ack && s.sptp_issued && s.hfi_issued && doorbells==2 && !transport.poisoned);
+ assert(s.cmd_read==7 && s.cmd_write==7 && s.msg_read==7 && s.msg_write==7);
+ assert(s.observed==2 && elapsed==10000000 && s.samples[0][2]==8 && s.samples[1][3]==1);
+ unsigned success_calls=calls;
+ unsigned expected[][2]={{0x8fe0,0},{0x8fe4,2},{0x8fe8,2},{0x14650,1u<<22},
+  {0x14644,1u<<30},{0x204,0x778000},{0x14618,1},{0x14644,1},{0x14644,1}};
+ assert(nwrites==sizeof(expected)/sizeof(expected[0]) && !memcmp(trace,expected,sizeof(expected)));once();
+ for(unsigned i=1;i<=success_calls;i++){reset();fail_at=i;assert(run()!=0);once();}
+ for(unsigned i=1;i<=6;i++){reset();timeout_stage=i;assert(run()==-4);assert(elapsed==(i==3?10000:100000));once();}
+ for(unsigned i=1;i<=8;i++){reset();corrupt_ack=i;assert(run()!=0);once();}
+ // Actual0151 INIT ACK has four words and omits request size. Exercise that
+ // through both exchanges; a VERSION without its required payload still fails.
+ for(unsigned mode=1;mode<=2;mode++){
+  reset();echo_mode=mode;gx_after_oob=0x28;assert(!run());
+  assert(s.init_ack && s.version_ack && s.cmd_read==7 && s.msg_read==8 && s.msg_write==8);
+  assert(s.original_header==(mode==1?0x00200001u:0x002fff01u));once();
+  for(unsigned i=1;i<=8;i++){reset();echo_mode=mode;corrupt_ack=i;assert(run()!=0);once();}
+ }
+ reset();echo_mode=1;assert(!run());unsigned compact_calls=calls;
+ for(unsigned i=1;i<=compact_calls;i++){reset();echo_mode=1;fail_at=i;assert(run()!=0);once();}
+ reset();doorbell_fail=1;assert(run()==-6 && transport.poisoned && s.init_sent && !s.init_ack && !s.version_sent);once();
+ reset();mmio[A6XX_GMU_GMU2HOST_INTR_INFO/4]=SWEET_GMU_BOOT_ACK;assert(run()==-3&&!nwrites);
+ reset();mmio[A6XX_GMU_HFI_CTRL_STATUS/4]=1;assert(run()==-3&&!nwrites);
+ reset();mmio[A6XX_GMU_HFI_VERSION_INFO/4]=0x20000000;assert(run()==-3 && s.init_ack && !s.version_sent);
+ reset();mmio[A6XX_GMU_HFI_VERSION_INFO/4]=0;assert(!run()); // stock treats major0 as legacy
+ reset();mmio[A6XX_GMU_GMU2HOST_INTR_INFO/4]=1u<<15;assert(run()==-5&&!nwrites);
+ for(unsigned bit=0;bit<32;bit++)if((1u<<bit)&0x29){reset();mmio[A6XX_GMU_AO_HOST_INTERRUPT_STATUS/4]=1u<<bit;assert(run()==-5&&!nwrites);}
+ for(unsigned i=0;i<54;i++){
+  reset();table[i]^=1;
+  if(i>=6 && ((i-6)%12==8 || (i-6)%12==9))assert(!run()); // live request flags
+  else assert(run()==-3&&!nwrites);
+ }
+ for(unsigned i=0;i<4;i++)for(unsigned j=8;j<=9;j++){
+  reset();table[6+12*i+j]=2;assert(run()==-3&&!nwrites);
+ }
+ unsigned offsets[]={0x14648,0x24c14,0x14600};
+ for(unsigned i=0;i<3;i++){reset();mmio[offsets[i]/4]=UINT32_MAX;assert(run()==-2&&!nwrites);}
+ reset();mmio[A6XX_GMU_HFI_VERSION_INFO/4]=UINT32_MAX;assert(run()==-2 && s.init_ack && !s.version_sent);
+ for(unsigned i=1;i<9;i++){reset();late_fault=i;assert(run()!=0);once();}
+ reset();event_kind=2;assert(!run() && s.debug_messages==1 && s.init_ack && s.version_ack);
+ reset();event_kind=1;assert(run()==-7 && s.event_code==0x1234 && s.firmware_error==0x1234 && !s.init_ack);
+ reset();mmio[A6XX_GMU_GMU2HOST_INTR_INFO/4]=1;assert(run()==-3 && !s.init_ack && !nwrites);
+ // A fresh OOB can leave SPTPRAC already on. Do not skip the stock power-on
+ // write/poll, and retain all failure/no-retry handling on these real states.
+ unsigned already_on[]={8,0x28};
+ for(unsigned j=0;j<2;j++){
+  reset();gx_after_oob=already_on[j];assert(!run());
+  assert(s.oob_ack && s.sptp_issued && s.hfi_issued && s.observed==2 && doorbells==2);
+  assert(nwrites==sizeof(expected)/sizeof(expected[0]) && !memcmp(trace,expected,sizeof(expected)));
+  assert(s.gx_status==already_on[j]);once();
+  for(unsigned i=1;i<=success_calls;i++){reset();gx_after_oob=already_on[j];fail_at=i;assert(run()!=0);once();}
+ }
+ unsigned inconsistent[]={0x2c,0x38,0x3c};
+ for(unsigned i=0;i<3;i++){
+  reset();gx_after_oob=inconsistent[i];assert(run()==-4 && elapsed==10000);
+  assert(s.oob_ack && s.sptp_issued && !s.hfi_issued && !doorbells);
+  assert(nwrites==6 && trace[5][0]==0x204 && trace[5][1]==0x778000);once();
+ }
+ reset();gx_after_oob=0x2c;sptp_settle=1;assert(!run() && elapsed==10000200 && s.gx_status==0x28);
+ assert(nwrites==sizeof(expected)/sizeof(expected[0]) && !memcmp(trace,expected,sizeof(expected)));once();
+ reset();gx_after_oob=0x2a;assert(!run() && s.gx_status==0x2a && s.sptp_issued && s.version_ack);once();
+ reset();gx_after_oob=0x28;sptp_lost=1;assert(run()==-3 && s.hfi_issued && !s.init_sent && !doorbells);once();
+ unsigned gx_off[]={0x40,0x80,0xc0,0xe8};
+ for(unsigned i=0;i<4;i++){
+  reset();gx_after_oob=gx_off[i];assert(run()==-4 && elapsed==100000);
+  assert(s.oob_ack && !s.sptp_issued && !s.hfi_issued && !doorbells);once();
+ }
+ reset();gx_after_oob=UINT32_MAX;assert(run()==-2 && !s.sptp_issued && !s.hfi_issued);once();
+ reset();observe_fault=1;assert(run()==-5 && s.version_ack && s.stage==SWEET_GMU_POST_OBSERVE && !s.observed);
+ reset();early_debug=101;assert(!run() && s.debug_messages==1 && s.dbg_read==4 && s.dbg_write==4);
+ reset();early_debug=100;assert(run()==-7 && s.firmware_error==0x4321 && !s.init_sent);
+ for(unsigned queue=1;queue<=2;queue++){
+  reset();late_event=100;late_queue=queue;
+  assert(run()==-7 && s.version_ack && s.stage==SWEET_GMU_POST_OBSERVE && !s.observed && s.firmware_error==0x4321);
+  reset();late_event=101;late_queue=queue;
+  assert(!run() && s.debug_messages==1 && s.observed==2);
+ }
+ reset();event_kind=2;timeout_stage=6;assert(run()==-4 && s.init_ack && !s.version_ack);
+ assert((s.response_header&255)==126 && (s.original_header&255)==0 && (s.event_header&255)==101);
+ printf("PASS postboot model: %u callback failures, six deadlines, already-on SPTP, compact/full ACK echoes, wrong command/sequence/error/missing VERSION payload, IRQs, no retry/host-request clear\n",3*success_calls+compact_calls);
+}
+'''
+(work/'test.c').write_text(program)
+subprocess.run(['gcc','-std=c11','-Wall','-Wextra','-Werror','-fsanitize=address,undefined',
+                '-fno-sanitize-recover=all','-g','-I',str(src),str(work/'test.c'),
+                *[str(src/(n+'.c')) for n in ('sweet_gmu_postboot','sweet_hfi_transport','sweet_hfi_codec','sweet_gpu_hfi_table','sweet_hfi_config','sweet_hfi_perf','sweet_hfi_bw')],
+                '-o',str(work/'test')],check=True)
+subprocess.run([str(work/'test')],check=True)

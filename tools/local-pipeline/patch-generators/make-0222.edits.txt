@@ -1,0 +1,136 @@
+edit('''	bool        nint_busy;              /* a RESPONSE_AVAILABLE in flight */
+''', '''	bool        nint_busy;              /* a RESPONSE_AVAILABLE in flight */
+	uint64_t    tx_started;             /* mach time the running network TX transfer started */
+''')
+edit('''		ud.net_tx_busy = true;
+		ud.tx_frames++;
+		ud_start_trb(ud.ep_ntx, ud.trb_ntx, ud.buf_ntx, (uint32_t)len, TRBCTL_NORMAL);
+	}
+}
+''', '''		if (ud_start_trb(ud.ep_ntx, ud.trb_ntx, ud.buf_ntx, (uint32_t)len, TRBCTL_NORMAL)) {
+			/* Before this the endpoint stayed "busy" for ever and ue0 never sent again. */
+			static unsigned failed;
+			if (failed++ < 8) {
+				printf("SWEET USB: ue0 TX start failed, frame dropped\\n");
+			}
+			break;
+		}
+		ud.net_tx_busy = true;
+		ud.tx_started = mach_absolute_time();
+		ud.tx_frames++;
+	}
+}
+''')
+edit('''	} else if (req == 1 || req == 3) { /* CLEAR/SET_FEATURE (halt, remote wakeup) */
+	} else {
+''', '''	} else if ((req == 1 || req == 3) && type == 0x02 && value == 0) {
+		ud_endpoint_halt((uint8_t)index, req == 3);     /* CLEAR/SET_FEATURE(ENDPOINT_HALT) */
+	} else if (req == 1 || req == 3) { /* CLEAR/SET_FEATURE (remote wakeup and the like) */
+	} else {
+''')
+edit('''static void
+ud_thread(void *arg __unused, wait_result_t wr __unused)
+{
+	uint32_t ticks = 0;
+''', '''/*
+ * The network TX transfer has run for over 2 s: the host stopped reading it (a pipe reset, an
+ * error). End it, drop the frame and go on with the queue, rather than never sending again.
+ */
+static void
+ud_tx_watchdog(void)
+{
+	static uint64_t limit;
+	if (limit == 0) {
+		nanoseconds_to_absolutetime(2 * NSEC_PER_SEC, &limit);
+	}
+	if (!ud.net || !ud.net_tx_busy || mach_absolute_time() - ud.tx_started < limit) {
+		return;
+	}
+	static unsigned fired;
+	lck_mtx_lock(ud.lock);
+	if (ud.net_tx_busy && mach_absolute_time() - ud.tx_started >= limit) {
+		ud_end_transfer(ud.ep_ntx);
+		ud.net_tx_busy = false;
+		if (fired++ < 16) {
+			printf("SWEET USB: ue0 TX stuck for 2 s: transfer ended, frame dropped\\n");
+		}
+		ud_tx_kick_locked();
+	}
+	lck_mtx_unlock(ud.lock);
+}
+
+static void
+ud_thread(void *arg __unused, wait_result_t wr __unused)
+{
+	uint32_t ticks = 0;
+''')
+edit('''		if (ud.serial) {
+			ud_serial_tx();
+		}
+		if (ud.net && (++ticks % 30000) == 0) {
+''', '''		if (ud.serial) {
+			ud_serial_tx();
+		}
+		ud_tx_watchdog();
+		if (ud.net && (++ticks % 30000) == 0) {
+''')
+edit('''/*
+ * USB reset (Linux dwc3_gadget_reset_interrupt): the host may reset the bus in the middle of a
+''', '''#define DEPCMD_CLEARSTALL       5
+
+/*
+ * CLEAR_FEATURE / SET_FEATURE(ENDPOINT_HALT) for endpoint address addr (Linux
+ * __dwc3_gadget_ep_set_halt). Windows clears the halt of a pipe it reset after an error; the
+ * device must then end what runs there, reset the data sequence (Clear Stall) and start again.
+ * Before this the request was only acknowledged, the sequence numbers no longer matched and the
+ * network stopped until the cable was pulled.
+ */
+static void
+ud_endpoint_halt(uint8_t addr, bool halt)
+{
+	unsigned ep = ((unsigned)(addr & 0x0f) << 1) | ((addr & 0x80) ? 1u : 0u);
+	static unsigned logged;
+
+	if (ep < 2 || ep >= 16) {
+		return;
+	}
+	if (logged++ < 16) {
+		printf("SWEET USB: %s halt of endpoint 0x%02x\\n", halt ? "set" : "clear", addr);
+	}
+	if (halt) {
+		ud_end_transfer(ep);
+		(void)ud_epcmd(ep, DEPCMD_SETSTALL, 0, 0, 0);
+		return;
+	}
+	ud_end_transfer(ep);
+	(void)ud_epcmd(ep, DEPCMD_CLEARSTALL, 0, 0, 0);
+	if (!ud.configured) {
+		return;
+	}
+	if (ud.net && ep == ud.ep_nrx) {
+		ud_rx_arm();
+	} else if (ud.net && ep == ud.ep_ntx) {
+		lck_mtx_lock(ud.lock);
+		ud.net_tx_busy = false;
+		ud_tx_kick_locked();
+		lck_mtx_unlock(ud.lock);
+	} else if (ud.rndis && ep == ud.ep_nint) {
+		ud.nint_busy = false;
+		if (ud.nint_pending) {
+			ud.nint_pending--;
+			rndis_notify();
+		}
+	} else if (ud.serial && ep == EP_RX) {
+		ud_serial_rx_arm();
+	} else if (ud.serial && ep == EP_TX) {
+		ud.tx_busy = false;
+	}
+}
+
+/*
+ * USB reset (Linux dwc3_gadget_reset_interrupt): the host may reset the bus in the middle of a
+''')
+edit('''static void ud_link_event(bool up);
+''', '''static void ud_link_event(bool up);
+static void ud_endpoint_halt(uint8_t addr, bool halt);
+''')

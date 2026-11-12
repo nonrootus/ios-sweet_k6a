@@ -1,0 +1,19 @@
+"""Patch 0219: the USB device survives a bus reset; RNDIS notifications and answers are queued.
+
+0218n on Windows 10: RNDIS came up (packet filter 0xb, 868 frames in, 36 out, 475 76-byte SETs)
+and after about four minutes the phone stopped answering on USB: Windows showed "device descriptor
+request failed" and the console stopped. The log's last control requests were two 76-byte
+SEND_ENCAPSULATED_COMMANDs with no GET_ENCAPSULATED_RESPONSE between them, i.e. Windows did not
+get (or gave up on) a RESPONSE_AVAILABLE. The gadget had three ways to wedge there:
+ - rndis_notify() started the interrupt endpoint again while its previous notification was still
+   in flight (Start Transfer on a busy endpoint fails, the notification is lost);
+ - one answer buffer: a second command before the first answer was read overwrote it;
+ - a USB reset only cleared the address: EP0 stayed in its data or status stage with no SETUP
+   TRB armed, so after Windows reset the port its GET_DESCRIPTOR never completed.
+Now: one RESPONSE_AVAILABLE at a time (the rest are sent as each completes), up to four unread
+answers, the transfer resource index of every started transfer is kept, a bus reset ends every
+active transfer (Linux dwc3_gadget_reset_interrupt / dwc3_ep0_stall_and_restart), unconfigures the
+device and arms SETUP again, and a control data stage the host abandons (XferNotReady for the other
+direction) stalls and restarts EP0. The first SETs log their OID.
+Base: CI build tree 40478936434 plus 0180, 0211, 0216 and 0218 for bsd/dev/sweet_usb.c.
+"""
